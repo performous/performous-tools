@@ -1,7 +1,7 @@
 #include "ss_cover.hh"
 
 #include "pak.h"
-#include "../common/image.hh"
+#include "image.hh"
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/lexical_cast.hpp>
