@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """Ultrastar TXT file duet merger
 =================================
@@ -37,7 +37,7 @@ import argparse
 
 class FileFormatViolation(Exception): "An input file is not formed as the author of this program expects it."
 
-class TXTFile(object):
+class TXTFile:
     """UltraStar TXT song description"""
     def __init__(self, filelike):
         self.headers = OrderedDict()
@@ -231,7 +231,7 @@ def main():
     else:
         try:
             merge(args.input, args.output, args.title)
-        except (FileFormatViolation, ValueError), e:
+        except (FileFormatViolation, ValueError) as e:
             sys.stderr.write("Could not complete merging: %s\n"%e)
             sys.exit(1)
 
