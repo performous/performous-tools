@@ -26,24 +26,39 @@ struct Song {
 	fs::path path, music, vocals, video, background, cover;
 	unsigned samplerate;
 	double tempo;
-	bool pal;
-	Song(): samplerate(), tempo() {}
+	bool isDuet, pal;
+        double medleyStart, medleyEnd;
+	Song(): samplerate(), tempo(), isDuet(), medleyStart(), medleyEnd() {}
 };
 
 #include "ss_binary.hh"
 
+enum Singer {
+	SINGER1,
+	SINGER2,
+	NUM_SINGERS
+};
+
 std::string dvdPath;
 std::ofstream txtfile;
+std::string singerName[NUM_SINGERS];
+std::stringstream singerNotes[NUM_SINGERS];
+bool singerActive[NUM_SINGERS];
 int ts = 0;
 int sleepts = -1;
+int pitch_offset = 0;
 bool g_video = true;
 bool g_audio = true;
 bool g_mkvcompress = true;
+bool g_mp4compress = true;
 bool g_oggcompress = true;
+bool g_mp3compress = true;
 bool g_createtxt = true;
+bool g_duet = true;
 
 void parseNote(xmlpp::Node* node) {
 	xmlpp::Element& elem = dynamic_cast<xmlpp::Element&>(*node);
+	std::stringstream notes;
 	char type = ':';
 	std::string lyric = elem.get_attribute("Lyric")->get_value();
 	// Some extra formatting to make lyrics look better (hyphen removal & whitespace)
@@ -55,18 +70,49 @@ void parseNote(xmlpp::Node* node) {
 	}
 	unsigned note = boost::lexical_cast<unsigned>(elem.get_attribute("MidiNote")->get_value().c_str());
 	unsigned duration = boost::lexical_cast<unsigned>(elem.get_attribute("Duration")->get_value().c_str());
-	if (elem.get_attribute("FreeStyle")) type = 'F';
-	if (elem.get_attribute("Bonus")) type = '*';
+        bool rap = elem.get_attribute("Rap");
+        bool golden = elem.get_attribute("Bonus");
+        bool freestyle = elem.get_attribute("FreeStyle");
+        if (!rap && golden) type = '*';
+        else if (rap && !golden) type = 'R';
+        else if (rap && golden) type = 'G';
+        else if (freestyle) type = 'F';
 	if (note) {
-		if (sleepts > 0) txtfile << "- " << sleepts << '\n';
+		if (sleepts > 0) notes << "- " << sleepts << '\n';
 		sleepts = 0;
-		txtfile << type << ' ' << ts << ' ' << duration << ' ' << note << ' ' << lyric << '\n';
+		notes << type << ' ' << ts << ' ' << duration << ' ' << note - pitch_offset << ' ' << lyric << '\n';
 	}
 	ts += duration;
+
+	bool written = false;
+	for (int i = 0; i < NUM_SINGERS; ++i) {
+		if (singerActive[i]) {
+			singerNotes[i] << notes.str();
+			written = true;
+		}
+	}
+	if (!written)
+		throw std::runtime_error("No singer for note");
 }
 
-void parseSentence(xmlpp::Node* node) {
+void parseSentence(xmlpp::Node* node, bool withSinger) {
 	xmlpp::Element& elem = dynamic_cast<xmlpp::Element&>(*node);
+	if (withSinger) {
+		xmlpp::Attribute* singerAttr = elem.get_attribute("Singer");
+		if (singerAttr) {
+			std::string singerStr = singerAttr->get_value();
+			for (int i = 0; i < NUM_SINGERS; ++i)
+				singerActive[i] = false;
+			if (singerStr == "Solo 1") {
+				singerActive[SINGER1] = true;
+			} else if (singerStr == "Solo 2") {
+				singerActive[SINGER2] = true;
+			} else if (singerStr == "Group") {
+				singerActive[SINGER1] = true;
+				singerActive[SINGER2] = true;
+			} else throw std::runtime_error("Invalid Singer");
+		}
+	}
 	// FIXME: Get rid of this or use SSDom's find
 	xmlpp::Node::PrefixNsMap nsmap;
 	nsmap["ss"] = "http://www.singstargame.com";
@@ -74,6 +120,14 @@ void parseSentence(xmlpp::Node* node) {
 	if (n.empty()) n = elem.find("NOTE");
 	if (sleepts != -1) sleepts = ts;
 	std::for_each(n.begin(), n.end(), parseNote);
+}
+
+void parseSentenceWithSinger(xmlpp::Node* node) {
+	parseSentence(node, true);
+}
+
+void parseSentenceWithoutSinger(xmlpp::Node* node) {
+	parseSentence(node, false);
 }
 
 struct Match {
@@ -85,20 +139,11 @@ struct Match {
 	}
 };
 
-void saveTxtFile(xmlpp::const_NodeSet &sentence, const fs::path &path, const Song &song, const std::string singer = "") {
+void initTxtFile(const fs::path &path, const Song &song, const std::string suffix = "") {
 	fs::path file_path;
-
-	if( singer.empty() ) {
-		file_path = path / "notes.txt";
-	} else {
-		file_path = path;
-		file_path /= safename(std::string("notes") + " (" + singer + ")" + ".txt");
-	}
+	file_path = path / (std::string("notes") + suffix + ".txt");
 	txtfile.open(file_path.string().c_str());
-	if( singer.empty() )
-		txtfile << "#TITLE:" << song.title << std::endl;
-	else
-		txtfile << "#TITLE:" << song.title << " (" << singer << ")" << std::endl;
+	txtfile << "#TITLE:" << song.title << suffix << std::endl;
 	txtfile << "#ARTIST:" << song.artist << std::endl;
 	if (!song.genre.empty()) txtfile << "#GENRE:" << song.genre << std::endl;
 	if (!song.year.empty()) txtfile << "#YEAR:" << song.year << std::endl;
@@ -110,9 +155,15 @@ void saveTxtFile(xmlpp::const_NodeSet &sentence, const fs::path &path, const Son
 	if (!song.cover.empty()) txtfile << "#COVER:" << filename(song.cover) << std::endl;
 	//txtfile << "#BACKGROUND:background.jpg" << std::endl;
 	txtfile << "#BPM:" << song.tempo << std::endl;
-	ts = 0;
-	sleepts = -1;
-	std::for_each(sentence.begin(), sentence.end(), parseSentence);
+	if (song.medleyEnd > 0) {
+		int start = std::round(4 * (song.tempo / 60) * song.medleyStart);
+		txtfile << "#MEDLEYSTARTBEAT:" << start << std::endl;
+		int end = std::round(4 * (song.tempo / 60) * song.medleyEnd);
+		txtfile << "#MEDLEYENDBEAT:" << end << std::endl;
+	}
+}
+
+void finalizeTxtFile() {
 	txtfile << 'E' << std::endl;
 	txtfile.close();
 }
@@ -154,6 +205,7 @@ struct Process {
 				if (res == "Semiquaver") {}
 				else if (res == "Demisemiquaver") song.tempo *= 2.0;
 				else throw std::runtime_error("Unknown tempo resolution: " + res);
+				song.isDuet = e.get_attribute("Duet") && e.get_attribute("Duet")->get_value() == "Yes";
 			}
 			fs::create_directories(path);
 			remove = path;
@@ -195,6 +247,26 @@ struct Process {
 					}
 				}
 			}
+			if (g_mp3compress) {
+				if( !song.music.empty() ) {
+					std::cerr << ">>> Compressing audio into music.mp3" << std::endl;
+					std::string cmd = "lame \"" + song.music.string() + "\"";
+					std::cerr << cmd << std::endl;
+					if (std::system(cmd.c_str()) == 0) { // FIXME: std::system return value is not portable
+						fs::remove(song.music);
+						song.music = path / ("music.mp3");
+					}
+				}
+				if( !song.vocals.empty() ) {
+					std::cerr << ">>> Compressing audio into vocals.mp3" << std::endl;
+					std::string cmd = "lame \"" + song.vocals.string() + "\"";
+					std::cerr << cmd << std::endl;
+					if (std::system(cmd.c_str()) == 0) { // FIXME: std::system return value is not portable
+						fs::remove(song.vocals);
+						song.vocals = path / ("vocals.mp3");
+					}
+				}
+			}
 			if (g_video) {
 				std::cerr << ">>> Extracting video" << std::endl;
 				try {
@@ -221,25 +293,93 @@ struct Process {
 						song.video = path / "video.m4v";
 					}
 				}
+				if (g_mp4compress) {
+					std::cerr << ">>> Compressing video into video.mp4" << std::endl;
+					std::string cmd = "ffmpeg -i \"" + (path / "video.mpg").string() + "\" -vcodec libx264 -profile main -crf 25 -threads 0 -metadata album=\"" + song.edition + "\" -metadata author=\"" + song.artist + "\" -metadata comment=\"" + song.genre + "\" -metadata title=\"" + song.title + "\" \"" + (path / "video.mp4\"").string();
+					std::cerr << cmd << std::endl;
+					if (std::system(cmd.c_str()) == 0) { // FIXME: std::system return value is not portable
+						fs::remove(path / "video.mpg");
+						song.video = path / "video.mp4";
+					}
+				}
 			}
 
 			if (g_createtxt) {
 				std::cerr << ">>> Extracting lyrics to notes.txt" << std::endl;
 				xmlpp::const_NodeSet sentences;
-				if(dom.find("/ss:MELODY/ss:SENTENCE", sentences)) {
-					// Sentences not inside tracks (normal songs)
-					std::cerr << "  >>> Solo track" << std::endl;
-					saveTxtFile(sentences, path, song);
-				} else {
+
+				if (song.isDuet) {
 					xmlpp::const_NodeSet tracks;
-					if (!dom.find("/ss:MELODY/ss:TRACK", tracks)) throw std::runtime_error("Unable to find any sentences in melody XML");
-					for (auto it = tracks.begin(); it != tracks.end(); ++it ) {
-						xmlpp::Element& elem = dynamic_cast<xmlpp::Element&>(**it);
-						std::string singer = elem.get_attribute("Artist")->get_value();
-						std::cerr << "  >>> Track from " << singer << std::endl;
-						dom.find(elem, "ss:SENTENCE", sentences);
-						saveTxtFile(sentences, path, song, singer);
+					if (!dom.find("/ss:MELODY/ss:TRACK", tracks)) throw std::runtime_error("Unable to find any tracks in melody XML");
+
+					if (tracks.size() != NUM_SINGERS)
+						throw std::runtime_error("Invalid number of tracks");
+
+					xmlpp::Element *trackElem[NUM_SINGERS];
+
+					auto it = tracks.begin();
+					for (int i = 0; i < NUM_SINGERS; ++i) {
+						trackElem[i] = dynamic_cast<xmlpp::Element*>(*it++);
+						xmlpp::Attribute *artistAttr = trackElem[i]->get_attribute("Artist");
+						if (!artistAttr) {
+							artistAttr = trackElem[i]->get_attribute("Name");
+							if (!artistAttr)
+								throw std::runtime_error("Track without Artist");
+						}
+						singerName[i] = artistAttr->get_value();
+						singerActive[i] = false;
 					}
+
+					if(dom.find("/ss:MELODY/ss:SENTENCE", sentences)) {
+						std::cerr << "  >>> Single-track duet" << std::endl;
+
+						ts = 0;
+						sleepts = -1;
+						std::for_each(sentences.begin(), sentences.end(), parseSentenceWithSinger);
+					} else {
+						std::cerr << "  >>> Double-track duet" << std::endl;
+
+						for (int i = 0; i < NUM_SINGERS; ++i) {
+							if (!dom.find(*trackElem[i], "ss:SENTENCE", sentences))
+								throw std::runtime_error("Unable to find any sentectes inside track in melody XML");
+							ts = 0;
+							sleepts = -1;
+							singerActive[i] = true;
+							std::for_each(sentences.begin(), sentences.end(), parseSentenceWithoutSinger);
+							singerActive[i] = false;
+						}
+					}
+					if (g_duet) {
+						initTxtFile(path, song);
+						for (int i = 0; i < NUM_SINGERS; ++i) {
+							txtfile << "#P" << i+1 << ": " << singerName[i] << "\n";
+						}
+						for (int i = 0; i < NUM_SINGERS; ++i) {
+							txtfile << "P" << i + 1 << "\n";
+							txtfile << singerNotes[i].rdbuf();
+						}
+						finalizeTxtFile();
+					} else {
+						for (int i = 0; i < NUM_SINGERS; ++i) {
+							initTxtFile(path, song, " (" + singerName[i] + ")");
+							txtfile << singerNotes[i].rdbuf();
+							finalizeTxtFile();
+						}
+					}
+				} else {
+					std::cerr << "  >>> Solo track" << std::endl;
+
+					if(!dom.find("/ss:MELODY/ss:SENTENCE", sentences)) throw std::runtime_error("Unable to find any sentences in melody XML");
+
+					ts = 0;
+					sleepts = -1;
+					for (int i = 0; i < NUM_SINGERS; ++i)
+						singerActive[i] = false;
+					singerActive[SINGER1] = true;
+					std::for_each(sentences.begin(), sentences.end(), parseSentenceWithoutSinger);
+					initTxtFile(path, song);
+					txtfile << singerNotes[SINGER1].rdbuf();
+					finalizeTxtFile();
 				}
 			}
 		} catch (std::exception& e) {
@@ -339,6 +479,16 @@ struct FindSongs {
 			if (dom.find(elem, "ss:VIDEO/@FRAME_RATE", fr))
 			  fps = boost::lexical_cast<double>(dynamic_cast<xmlpp::Attribute&>(*fr[0]).get_value().c_str());
 			if (fps == 25.0) s.pal = true;
+			const xmlpp::Node::NodeList medleys = elem.get_children("MEDLEYS");
+			if (medleys.size() > 0) {
+				for (auto const &mt : medleys.front()->get_children("TYPE")) {
+					xmlpp::Element& elem = dynamic_cast<xmlpp::Element&>(*mt);
+					if (elem.get_first_child_text()->get_content() == "Normal") {
+						s.medleyStart = std::stod(elem.get_attribute("Start")->get_value());
+						s.medleyEnd = std::stod(elem.get_attribute("End")->get_value());
+					}
+				}
+			}
 			// Store song info to songs container
 			songs[elem.get_attribute("ID")->get_value()] = s;
 		}
@@ -356,9 +506,11 @@ int main( int argc, char **argv) {
 	  ("dvd", po::value<std::string>(&dvdPath), "path to Singstar DVD root")
 	  ("list,l", "list tracks only")
 	  ("song", po::value<std::string>(&song), "only extract the given track (ID or partial name)")
-	  ("video", po::value<std::string>(&video)->default_value("mkv"), "specify video format (none, mkv, mpeg2)")
-	  ("audio", po::value<std::string>(&audio)->default_value("ogg"), "specify audio format (none, ogg, wav)")
+	  ("video", po::value<std::string>(&video)->default_value("mkv"), "specify video format (none, mkv, mp4, mpeg2)")
+	  ("audio", po::value<std::string>(&audio)->default_value("ogg"), "specify audio format (none, ogg, mp3, wav)")
 	  ("txt,t", "also convert XML to notes.txt (for UltraStar compatibility)")
+	  ("duet,d", "create single duet-mode txt file for duets")
+	  ("offset,o", "apply correct pitch offset")
 	  ;
 	// Process the first flagless option as dvd, the second as song
 	po::positional_options_description pos;
@@ -376,32 +528,50 @@ int main( int argc, char **argv) {
 		if (video == "none") {
 			g_video = false;
 			g_mkvcompress = false;
+			g_mp4compress = false;
 		} else if (video == "mkv") {
 			g_video = true;
 			g_mkvcompress = true;
+			g_mp4compress = false;
+		} else if (video == "mp4") {
+			g_video = true;
+			g_mkvcompress = false;
+			g_mp4compress = true;
 		} else if (video == "mpeg2") {
 			g_video = true;
 			g_mkvcompress = false;
+			g_mp4compress = false;
 		} else {
-			throw std::runtime_error("Invalid video flag. Value must be {none, mkv, mpeg2}");
+			throw std::runtime_error("Invalid video flag. Value must be {none, mkv, mp4, mpeg2}");
 		}
 		std::cerr << ">>> Using video flag: \"" << video << "\"" << std::endl;
 		// Process audio flag
 		if (audio == "none") {
 			g_audio = false;
 			g_oggcompress = false;
+			g_mp3compress = false;
 		} else if (audio == "ogg") {
 			g_audio = true;
 			g_oggcompress = true;
+			g_mp3compress = false;
+		} else if (audio == "mp3") {
+			g_audio = true;
+			g_oggcompress = false;
+			g_mp3compress = true;
 		} else if (audio == "wav") {
 			g_audio = true;
 			g_oggcompress = false;
+			g_mp3compress = false;
 		} else {
-			throw std::runtime_error("Invalid audio flag. Value must be {none, ogg, wav}");
+			throw std::runtime_error("Invalid audio flag. Value must be {none, ogg, mp3, wav}");
 		}
 		std::cerr << ">>> Using audio flag: \"" << audio << "\"" << std::endl;
-		g_createtxt = vm.count("txt") > 0;
+		g_createtxt = vm.count("txt") > 0 || vm.count("duet") > 0;
+		g_duet = vm.count("duet") > 0;
+		pitch_offset = (vm.count("offset") > 0 ? 60 : 0);
 		std::cerr << ">>> Convert XML to notes.txt: " << (g_createtxt?"yes":"no") << std::endl;
+		std::cerr << ">>> Create single duet-mode txt file for duets: " << (g_duet?"yes":"no") << std::endl;
+		std::cerr << ">>> Apply correct pitch offset: " << (pitch_offset?"yes":"no") << std::endl;
 	} catch (std::exception& e) {
 		std::cout << cmdline << std::endl;
 		std::cout << "ERROR: " << e.what() << std::endl;
